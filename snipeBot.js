@@ -153,17 +153,44 @@ function secsLeft(market) {
   return Math.max(0, (new Date(end).getTime() - Date.now()) / 1000);
 }
 
-function getTokenIds(market) {
+// Kept as sync for quick local extraction only — no API call
+function getTokenIdsLocal(market) {
   try {
     let ids = market.clobTokenIds;
     if (typeof ids === 'string') ids = JSON.parse(ids);
-    if (Array.isArray(ids) && ids.length >= 1) return ids;
+    if (Array.isArray(ids) && ids.length >= 2) return ids;
   } catch(e) {}
   try {
-    const tokens = market.tokens;
-    if (Array.isArray(tokens)) return tokens.map(t => t.token_id || t.tokenId || t.id).filter(Boolean);
+    if (Array.isArray(market.tokens)) {
+      const ids = market.tokens.map(t => t.token_id || t.tokenId || t.id).filter(Boolean);
+      if (ids.length >= 2) return ids;
+    }
   } catch(e) {}
   return [];
+}
+
+/**
+ * Resolves the two CLOB token IDs for a market.
+ * 1. Tries fields already in the Gamma API response (fast, no extra request).
+ * 2. Falls back to querying the CLOB API by conditionId when Gamma omits them.
+ * Returns { ids: string[], source: string }
+ */
+async function resolveTokenIds(market) {
+  const local = getTokenIdsLocal(market);
+  if (local.length >= 2) return { ids: local, source: 'gamma' };
+
+  // CLOB fallback — fetch by conditionId
+  const condId = market.conditionId;
+  if (condId) {
+    const data = await httpGet(`https://clob.polymarket.com/markets?condition_id=${condId}`, 4000);
+    try {
+      const m   = Array.isArray(data) ? data[0] : data;
+      const ids = (m?.tokens || []).map(t => t.token_id).filter(Boolean);
+      if (ids.length >= 2) return { ids, source: 'clob' };
+    } catch(e) {}
+  }
+
+  return { ids: [], source: 'none' };
 }
 
 // ─── REAL FILL SIMULATION ─────────────────────────────────────────────────────
@@ -276,15 +303,16 @@ async function scanOrderBook(tokenId, outcomeLabel, minAsk, maxAsk) {
 
 // ─── WATCHING CACHE HELPER ────────────────────────────────────────────────────
 /**
- * Updates the live-price cache used by the WATCHING display panel.
- * Called after every order book probe regardless of whether it qualifies.
+ * Upserts the live-price cache entry.
+ * status values: 'resolving' | 'no IDs' | 'book error' | 'empty book' | 'live'
+ * sideResults may be null/undefined — pass them only when books were fetched.
  */
-function updateWatching(market, sideResults) {
+function updateWatching(market, status, sideResults) {
   const condId = market.conditionId || market.id || market._slug;
   if (!condId) return;
 
-  const sides = sideResults
-    .filter(r => r !== null)
+  const sides = (sideResults || [])
+    .filter(r => r !== null && r !== undefined)
     .map(r => ({
       label:     r.outcomeLabel,
       price:     r.bestAskPrice,
@@ -292,27 +320,41 @@ function updateWatching(market, sideResults) {
     }));
 
   S.watching[condId] = {
-    question: market.question || market._slug || market.title || '?',
-    secs:     secsLeft(market),
+    question:   market.question || market._slug || market.title || '?',
+    secs:       secsLeft(market),
     marketType: market._cryptoType || 'GENERAL',
+    status,
     sides,
-    updated:  Date.now(),
+    updated:    Date.now(),
   };
 }
 
 // ─── EVALUATE GENERAL MARKET ──────────────────────────────────────────────────
 async function evaluateGeneralMarket(market) {
-  const secs   = secsLeft(market);
-  const tokens = getTokenIds(market);
-  if (tokens.length < 2) return null;
+  const secs = secsLeft(market);
+
+  updateWatching(market, 'resolving');
+  const { ids: tokens, source } = await resolveTokenIds(market);
+
+  if (tokens.length < 2) {
+    updateWatching(market, `no IDs (${source})`);
+    dbg(`  General market: no token IDs (${source}) — ${shortQ(market.question, 30)}`);
+    return null;
+  }
 
   const [yesResult, noResult] = await Promise.all([
     scanOrderBook(tokens[0], 'YES', CFG.MIN_ASK_PRICE_GENERAL, CFG.MAX_ASK_PRICE),
     scanOrderBook(tokens[1], 'NO',  CFG.MIN_ASK_PRICE_GENERAL, CFG.MAX_ASK_PRICE),
   ]);
 
-  // Always update watching with price data (even non-qualifying)
-  updateWatching(market, [yesResult, noResult].filter(Boolean));
+  if (!yesResult && !noResult) {
+    updateWatching(market, 'book error');
+    return null;
+  }
+
+  const sides = [yesResult, noResult].filter(Boolean);
+  const hasAny = sides.some(r => r.bestAskPrice !== null);
+  updateWatching(market, hasAny ? 'live' : 'empty book', sides);
 
   const qYes = yesResult?.qualified ? yesResult : null;
   const qNo  = noResult?.qualified  ? noResult  : null;
@@ -406,17 +448,37 @@ async function fetchCrypto5mMarkets() {
 }
 
 async function evaluateCrypto5mMarket(market) {
-  const secs   = secsLeft(market);
-  const tokens = getTokenIds(market);
-  if (tokens.length < 2) return null;
+  const secs = secsLeft(market);
+
+  // Set initial state immediately so the panel always shows something
+  updateWatching(market, 'resolving');
+  const { ids: tokens, source } = await resolveTokenIds(market);
+
+  if (tokens.length < 2) {
+    // Log once per market (not every scan) using the conditionId as a dedup key
+    const condId = market.conditionId || market.id || market._slug;
+    if (!S._noIdLogged) S._noIdLogged = {};
+    if (!S._noIdLogged[condId]) {
+      log(C.d(`  ${market._asset}: no token IDs (${source}) — order book unavailable`));
+      S._noIdLogged[condId] = true;
+    }
+    updateWatching(market, `no IDs (${source})`);
+    return null;
+  }
 
   const [upResult, downResult] = await Promise.all([
     scanOrderBook(tokens[0], `${market._asset} UP`,   CFG.MIN_ASK_PRICE_CRYPTO, CFG.MAX_ASK_PRICE),
     scanOrderBook(tokens[1], `${market._asset} DOWN`, CFG.MIN_ASK_PRICE_CRYPTO, CFG.MAX_ASK_PRICE),
   ]);
 
-  // Always update watching with live prices
-  updateWatching(market, [upResult, downResult].filter(Boolean));
+  if (!upResult && !downResult) {
+    updateWatching(market, 'book error');
+    return null;
+  }
+
+  const sides  = [upResult, downResult].filter(Boolean);
+  const hasAny = sides.some(r => r.bestAskPrice !== null);
+  updateWatching(market, hasAny ? 'live' : 'empty book', sides);
 
   const qUp   = upResult?.qualified   ? upResult   : null;
   const qDown = downResult?.qualified ? downResult : null;
@@ -688,27 +750,41 @@ function display() {
     .slice(0, 10);
 
   console.log('\n' + L);
-  console.log('  ' + C.b('WATCHING') + C.d(`  (${watchList.length} markets live — prices update every scan)`));
+  console.log('  ' + C.b('WATCHING') + C.d(`  (${watchList.length} markets — prices update every scan)`));
 
   if (watchList.length === 0) {
     console.log(C.d('  no markets in scan window yet...'));
   } else {
     for (const w of watchList) {
-      const secStr  = w.secs <= CFG.SNIPE_WINDOW ? C.y(`${w.secs.toFixed(0)}s ⚡`) : C.d(`${w.secs.toFixed(0)}s`);
+      const sn      = typeof w.secs === 'number' ? w.secs : 0;
+      const secStr  = sn <= CFG.SNIPE_WINDOW ? C.y(`${sn.toFixed(0)}s ⚡`) : C.d(`${sn.toFixed(0)}s `);
       const typeTag = w.marketType === 'CRYPTO_5M' ? C.m('[5M]') : C.d('[GEN]');
-      const priceStr = w.sides.map(s => {
-        const pct = s.price != null ? (s.price * 100).toFixed(0) + '¢' : '—';
-        // Color: green if qualifies, yellow if ≥ 80¢, gray otherwise
-        const colored = s.qualifies       ? C.g(pct)
-                      : s.price >= 0.80   ? C.y(pct)
-                      :                     C.d(pct);
-        return `${s.label.split(' ').pop()}:${colored}`;
-      }).join('  ');
 
-      console.log(`  ${typeTag} ${secStr.padEnd(8)} ${C.c(shortQ(w.question, 34))}  ${priceStr}`);
+      let infoStr;
+      if (w.status === 'live' && w.sides && w.sides.length > 0) {
+        // Live order book — show actual prices with color coding
+        infoStr = w.sides.map(s => {
+          const pct     = s.price != null ? (s.price * 100).toFixed(0) + '¢' : '--¢';
+          const colored = s.qualifies     ? C.g(pct)
+                        : s.price >= 0.80 ? C.y(pct)
+                        :                   C.d(pct);
+          // Show just the side label (UP/DOWN/YES/NO)
+          const lbl = s.label.split(' ').pop();
+          return `${lbl}:${colored}`;
+        }).join('  ');
+      } else if (w.status === 'empty book') {
+        infoStr = C.d('empty book — no open limit orders');
+      } else if (w.status && w.status.startsWith('no IDs')) {
+        infoStr = C.r(w.status) + C.d('  ← CLOB token lookup failed');
+      } else if (w.status === 'book error') {
+        infoStr = C.r('book error') + C.d('  ← CLOB /orderbook call failed');
+      } else {
+        infoStr = C.d(w.status || '...');
+      }
+
+      console.log(`  ${typeTag} ${secStr}  ${C.c(shortQ(w.question, 32))}  ${infoStr}`);
     }
-    // Reminder of what price we need to fire
-    console.log(C.d(`  Need: crypto ≥95¢ general ≥93¢ — in green = qualifies, yellow = close`));
+    console.log(C.d(`  Need: crypto ≥95¢  general ≥93¢  — green = qualifies, yellow = close`));
   }
 
   // ── Open positions ──────────────────────────────────────────────────────────
