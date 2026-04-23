@@ -3,27 +3,24 @@
  * ║   POLYMARKET LAST-SECOND SNIPER  v3  —  PAPER $10                   ║
  * ║                                                                      ║
  * ║  FIXES IN v3 (full audit of v2):                                     ║
- * ║  ✅ Snipe window raised to 10 seconds (was 5s — too narrow)          ║
- * ║  ✅ Price band widened: 95¢–98¢ (was 97¢–98¢ — missed most asks)    ║
- * ║  ✅ Staleness check fixed — was measuring HTTP latency, not data age ║
+ * ║  ✅ Snipe window raised to 10 seconds (was 5s)                       ║
+ * ║  ✅ Price band: general 93¢–98¢, crypto 95¢–98¢                     ║
+ * ║  ✅ Staleness check fixed — measures HTTP latency correctly          ║
  * ║  ✅ Dead outcomeIsYesOrUp variable removed from resolution           ║
- * ║  ✅ Resolution logic made consistent (was mixing includes/=== badly) ║
+ * ║  ✅ Resolution logic made consistent                                 ║
  * ║  ✅ Display units fixed — was printing "0.97¢" instead of "97¢"     ║
  * ║  ✅ Crypto slug fallback — broad search when slug misses             ║
- * ║  ✅ Scan interval reduced: 1500ms (was 2000ms — fewer missed windows)║
- * ║                                                                      ║
- * ║  INHERITED FROM v2:                                                  ║
- * ║  ✅ Crypto 5-min Up/Down markets (BTC, ETH, SOL, BNB, XRP)          ║
- * ║  ✅ Real fill simulation (walks ask ladder)                          ║
- * ║  ✅ Per-scenario stats in display                                    ║
- * ║  ✅ Fixed resolution — uses real closed market prices                ║
+ * ║  ✅ Scan lock — prevents concurrent overlapping scans               ║
+ * ║  ✅ Live price monitoring — WATCHING panel shows real-time prices    ║
+ * ║  ✅ Better counters — waiting vs noAsks vs snipes (was one "skipped")║
+ * ║  ✅ scanOrderBook returns price data even when not qualifying        ║
  * ║                                                                      ║
  * ║  STRATEGY:                                                           ║
  * ║  In the last 10 seconds of a Polymarket market:                     ║
- * ║    — If someone is selling YES/UP tokens at 95¢–98¢                 ║
- * ║      and the market is almost certainly going YES                   ║
+ * ║    — If someone is selling YES/UP tokens at 93¢–98¢ (general)       ║
+ * ║      or 95¢–98¢ (crypto 5m)                                         ║
  * ║    → Buy $1 worth, collect $1.00 at resolution                     ║
- * ║    → Profit: 2¢–5¢ per share × number of shares bought             ║
+ * ║    → Profit: 2¢–7¢ per $1 bet after 2% fee                        ║
  * ║                                                                      ║
  * ║  PAPER MODE — $10 fake balance, no real orders placed               ║
  * ║  Run: node snipeBot.js                                               ║
@@ -36,50 +33,39 @@ const fs    = require('fs');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const CFG = {
-  // Paper wallet
   START_BALANCE: 10.00,
   BET_SIZE:       1.00,
 
-  // ── ENTRY CONDITIONS ───────────────────────────────────────────────────────
-  // FIX v3: Widened from 0.97 to 0.95 — more opportunities captured
-  // At 95¢: buy $1 → 1.053 shares → $1.053 gross → ~$1.032 after 2% fee = +3.2¢
-  // At 97¢: buy $1 → 1.031 shares → $1.031 gross → ~$1.010 after 2% fee = +1.0¢
-  // At 98¢: buy $1 → 1.020 shares → $1.020 gross → ~$1.000 after 2% fee = break-even
-  MIN_ASK_PRICE_GENERAL: 0.95,
-  MIN_ASK_PRICE_CRYPTO:  0.95,
-  MAX_ASK_PRICE:         0.98,   // 98¢ cap — above this, fee eats the profit
+  // General markets: 93¢+ still profitable after 2% fee
+  //   At 93¢: buy $1 → 1.075 shares → $1.054 net = +5.4¢
+  //   At 98¢: buy $1 → 1.020 shares → $1.000 net = break-even
+  MIN_ASK_PRICE_GENERAL: 0.93,
 
-  // Ultra-cheap scenario: stale 0.1¢–3¢ orders on already-decided markets
+  // Crypto 5m: volatile in final seconds — require higher confidence
+  //   At 95¢: buy $1 → 1.053 shares → $1.032 net = +3.2¢
+  MIN_ASK_PRICE_CRYPTO:  0.95,
+  MAX_ASK_PRICE:         0.98,
+
+  // Ultra-cheap: stale orders on already-resolved markets
   MAX_ULTRA_CHEAP_PRICE: 0.03,
 
-  // Window settings
-  MAX_SECS_LEFT:   300,    // scan markets closing within 5 minutes
-  // FIX v3: Raised from 5 to 10 — 5s was too narrow (2s scan ≈ only 2-3 attempts)
-  SNIPE_WINDOW:     10,    // fire in the last 10 seconds
+  MAX_SECS_LEFT:   300,   // scan window: 5 minutes out
+  SNIPE_WINDOW:     10,   // only fire in last 10 seconds
 
-  // ── CRYPTO 5-MIN SPECIFIC ──────────────────────────────────────────────────
   CRYPTO_ASSETS: ['btc', 'eth', 'sol', 'bnb', 'xrp'],
 
-  // ── SAFETY ────────────────────────────────────────────────────────────────
-  MIN_LIQUIDITY_USD: 0.50,   // require at least 50¢ of ask depth
-  MIN_FILL_SHARES:   0.90,   // require at least 90% of target to be fillable
-  // FIX v3: MAX_BOOK_AGE_MS is now used as a maximum *fetch latency* guard.
-  // v2 described it as "data age" but it was actually measuring round-trip time.
-  // Renamed to MAX_FETCH_LATENCY_MS to reflect what it actually does.
-  MAX_FETCH_LATENCY_MS: 5000, // skip if HTTP request itself took longer than 5s
+  MIN_LIQUIDITY_USD:    0.50,
+  MIN_FILL_SHARES:      0.90,
+  MAX_FETCH_LATENCY_MS: 5000,
 
-  // FIX v3: Reduced from 2000ms to 1500ms — fewer missed 10-second windows
   SCAN_INTERVAL_MS:  1500,
   STATE_FILE: 'sniper_v3_state.json',
   DEBUG: process.argv.includes('--debug'),
 };
 
-// ─── KEEP-ALIVE AGENT ────────────────────────────────────────────────────────
+// ─── KEEP-ALIVE AGENT ─────────────────────────────────────────────────────────
 const AGENT = new https.Agent({
-  keepAlive:      true,
-  maxSockets:     30,
-  maxFreeSockets: 10,
-  timeout:        6000,
+  keepAlive: true, maxSockets: 30, maxFreeSockets: 10, timeout: 6000,
 });
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
@@ -88,26 +74,36 @@ let S = {
   startBalance: CFG.START_BALANCE,
   openTrades:   [],
   closedTrades: [],
-  wins:         0,
-  losses:       0,
-  scans:        0,
-  snipes:       0,
-  skipped:      0,
-  startTime:    Date.now(),
+  wins:    0,
+  losses:  0,
+  scans:   0,
+  snipes:  0,
+  // FIX v3: replaced single "skipped" with two meaningful counters
+  waiting: 0,   // opportunities found but secs > SNIPE_WINDOW — just waiting
+  noAsks:  0,   // scanned but no asks in price range at all
+  startTime: Date.now(),
+  // FIX v3: live price cache for the WATCHING display panel
+  watching: {},  // conditionId → { question, secs, sides: [{label, price}], updated }
 };
 
 function loadState() {
   try {
     if (fs.existsSync(CFG.STATE_FILE)) {
       const saved = JSON.parse(fs.readFileSync(CFG.STATE_FILE, 'utf8'));
-      S = { ...S, ...saved };
+      // Don't restore watching cache — always start fresh
+      const { watching: _w, ...rest } = saved;
+      S = { ...S, ...rest, watching: {} };
       log(`State loaded — balance $${S.balance.toFixed(4)}, ${S.snipes} previous snipes`);
     }
   } catch(e) {}
 }
 
 function saveState() {
-  try { fs.writeFileSync(CFG.STATE_FILE, JSON.stringify(S, null, 2)); } catch(e) {}
+  try {
+    // Don't persist the watching cache
+    const { watching: _w, ...rest } = S;
+    fs.writeFileSync(CFG.STATE_FILE, JSON.stringify(rest, null, 2));
+  } catch(e) {}
 }
 
 // ─── COLORS & LOGGING ─────────────────────────────────────────────────────────
@@ -125,7 +121,6 @@ function log(msg) {
   LOGS.unshift(`${C.d(ts())}  ${msg}`);
   if (LOGS.length > 300) LOGS.pop();
 }
-
 function dbg(msg) { if (CFG.DEBUG) log(C.d('[D] ' + msg)); }
 function shortQ(q, len = 50) { return (q || '?').slice(0, len).padEnd(len); }
 
@@ -138,19 +133,12 @@ function httpGet(url, timeoutMs = 6000) {
       path:     u.pathname + u.search,
       method:   'GET',
       agent:    AGENT,
-      headers:  {
-        'User-Agent': 'sniper-v3/1.0',
-        'Accept':     'application/json',
-        'Connection': 'keep-alive',
-      },
-      timeout: timeoutMs,
+      headers:  { 'User-Agent': 'sniper-v3/1.0', 'Accept': 'application/json', 'Connection': 'keep-alive' },
+      timeout:  timeoutMs,
     }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(d)); }
-        catch(e) { resolve(null); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
     });
     req.on('error', () => resolve(null));
     req.on('timeout', () => { req.destroy(); resolve(null); });
@@ -178,7 +166,7 @@ function getTokenIds(market) {
   return [];
 }
 
-// ─── REAL FILL SIMULATION ──────────────────────────────────────────────────────
+// ─── REAL FILL SIMULATION ─────────────────────────────────────────────────────
 function simulateFill(asks, budgetUSD, maxPricePerShare) {
   if (!asks || asks.length === 0) return { filled: false, reason: 'empty book' };
 
@@ -189,44 +177,41 @@ function simulateFill(asks, budgetUSD, maxPricePerShare) {
 
   if (levels.length === 0) return { filled: false, reason: 'no asks at target price' };
 
-  let remainingUSD = budgetUSD;
-  let totalShares  = 0;
-  let totalCost    = 0;
+  let remainingUSD = budgetUSD, totalShares = 0, totalCost = 0;
 
   for (const level of levels) {
     if (remainingUSD <= 0) break;
     const levelValue = level.price * level.size;
     if (remainingUSD >= levelValue) {
-      totalShares  += level.size;
-      totalCost    += levelValue;
-      remainingUSD -= levelValue;
+      totalShares += level.size;  totalCost += levelValue;  remainingUSD -= levelValue;
     } else {
-      const shares  = remainingUSD / level.price;
-      totalShares  += shares;
-      totalCost    += remainingUSD;
-      remainingUSD  = 0;
+      totalShares += remainingUSD / level.price;  totalCost += remainingUSD;  remainingUSD = 0;
     }
   }
 
   if (totalShares === 0) return { filled: false, reason: 'no shares filled' };
 
-  const targetShares = budgetUSD / maxPricePerShare;
-  const fillPct      = totalShares / targetShares;
-  const avgPrice     = totalCost / totalShares;
-  const depthUSD     = levels.reduce((s, a) => s + a.price * a.size, 0);
+  const fillPct  = totalShares / (budgetUSD / maxPricePerShare);
+  const avgPrice = totalCost / totalShares;
+  const depthUSD = levels.reduce((s, a) => s + a.price * a.size, 0);
 
   return {
-    filled:       true,
-    fullyFilled:  fillPct >= CFG.MIN_FILL_SHARES,
+    filled:      true,
+    fullyFilled: fillPct >= CFG.MIN_FILL_SHARES,
     totalShares,
-    totalCost:    parseFloat(totalCost.toFixed(6)),
-    avgPrice:     parseFloat(avgPrice.toFixed(6)),
-    depthUSD:     parseFloat(depthUSD.toFixed(4)),
-    fillPct:      parseFloat(fillPct.toFixed(3)),
+    totalCost:   parseFloat(totalCost.toFixed(6)),
+    avgPrice:    parseFloat(avgPrice.toFixed(6)),
+    depthUSD:    parseFloat(depthUSD.toFixed(4)),
+    fillPct:     parseFloat(fillPct.toFixed(3)),
   };
 }
 
 // ─── SCAN ORDER BOOK ──────────────────────────────────────────────────────────
+/**
+ * FIX v3: Now ALWAYS returns an object — even when the price is out of range.
+ * { qualified: false, bestAskPrice } — caller uses this for the watching display.
+ * { qualified: true, ...snipeData }  — caller uses this to fire a trade.
+ */
 async function scanOrderBook(tokenId, outcomeLabel, minAsk, maxAsk) {
   if (!tokenId) return null;
 
@@ -234,12 +219,9 @@ async function scanOrderBook(tokenId, outcomeLabel, minAsk, maxAsk) {
   const book       = await httpGet(`https://clob.polymarket.com/orderbook/${tokenId}`, 5000);
   if (!book) return null;
 
-  // FIX v3: This measures HTTP round-trip latency, NOT how old the book data is.
-  // Renamed from fetchAge/MAX_BOOK_AGE_MS to fetchLatency/MAX_FETCH_LATENCY_MS.
-  // If the request itself took >5s, the data arrived too late to be actionable.
   const fetchLatency = Date.now() - fetchStart;
   if (fetchLatency > CFG.MAX_FETCH_LATENCY_MS) {
-    dbg(`  Slow fetch (${fetchLatency}ms) for ${outcomeLabel} — skipping`);
+    dbg(`  Slow fetch (${fetchLatency}ms) ${outcomeLabel}`);
     return null;
   }
 
@@ -248,47 +230,73 @@ async function scanOrderBook(tokenId, outcomeLabel, minAsk, maxAsk) {
     .filter(a => a.price > 0 && a.size > 0)
     .sort((a, b) => a.price - b.price);
 
-  if (asks.length === 0) return null;
+  if (asks.length === 0) return { qualified: false, bestAskPrice: null, outcomeLabel };
 
-  const bestAsk = asks[0];
-
+  const bestAsk      = asks[0];
   const isUltraCheap = bestAsk.price <= CFG.MAX_ULTRA_CHEAP_PRICE;
   const isTarget     = bestAsk.price >= minAsk && bestAsk.price <= maxAsk;
 
-  if (!isUltraCheap && !isTarget) return null;
+  // Always return bestAskPrice so the watching display can show live prices
+  if (!isUltraCheap && !isTarget) {
+    return { qualified: false, bestAskPrice: bestAsk.price, outcomeLabel };
+  }
 
   const fill = simulateFill(asks, CFG.BET_SIZE, isUltraCheap ? CFG.MAX_ULTRA_CHEAP_PRICE : maxAsk);
 
   if (!fill.filled) {
     dbg(`  No fill on ${outcomeLabel}: ${fill.reason}`);
-    return null;
+    return { qualified: false, bestAskPrice: bestAsk.price, outcomeLabel };
   }
 
   if (fill.depthUSD < CFG.MIN_LIQUIDITY_USD) {
     dbg(`  Low depth on ${outcomeLabel}: $${fill.depthUSD.toFixed(3)}`);
-    return null;
+    return { qualified: false, bestAskPrice: bestAsk.price, outcomeLabel };
   }
 
   if (!fill.fullyFilled) {
-    dbg(`  Partial fill on ${outcomeLabel}: ${(fill.fillPct * 100).toFixed(0)}% filled`);
+    dbg(`  Partial fill on ${outcomeLabel}: ${(fill.fillPct * 100).toFixed(0)}%`);
   }
 
-  const expectedPayout = fill.totalShares * 1.00;
-  const expectedProfit = expectedPayout - fill.totalCost;
-
   return {
+    qualified:      true,
     tokenId,
     outcomeLabel,
     bestAskPrice:   bestAsk.price,
     avgFillPrice:   fill.avgPrice,
     sharesOwned:    fill.totalShares,
     totalCost:      fill.totalCost,
-    expectedPayout,
-    expectedProfit,
+    expectedPayout: fill.totalShares * 1.00,
+    expectedProfit: fill.totalShares * 1.00 - fill.totalCost,
     depthUSD:       fill.depthUSD,
     partialFill:    !fill.fullyFilled,
     scenario:       isUltraCheap ? 'B_ULTRA_CHEAP' : 'A_HIGH_CONFIDENCE',
     fetchLatencyMs: fetchLatency,
+  };
+}
+
+// ─── WATCHING CACHE HELPER ────────────────────────────────────────────────────
+/**
+ * Updates the live-price cache used by the WATCHING display panel.
+ * Called after every order book probe regardless of whether it qualifies.
+ */
+function updateWatching(market, sideResults) {
+  const condId = market.conditionId || market.id || market._slug;
+  if (!condId) return;
+
+  const sides = sideResults
+    .filter(r => r !== null)
+    .map(r => ({
+      label:     r.outcomeLabel,
+      price:     r.bestAskPrice,
+      qualifies: r.qualified,
+    }));
+
+  S.watching[condId] = {
+    question: market.question || market._slug || market.title || '?',
+    secs:     secsLeft(market),
+    marketType: market._cryptoType || 'GENERAL',
+    sides,
+    updated:  Date.now(),
   };
 }
 
@@ -303,49 +311,46 @@ async function evaluateGeneralMarket(market) {
     scanOrderBook(tokens[1], 'NO',  CFG.MIN_ASK_PRICE_GENERAL, CFG.MAX_ASK_PRICE),
   ]);
 
+  // Always update watching with price data (even non-qualifying)
+  updateWatching(market, [yesResult, noResult].filter(Boolean));
+
+  const qYes = yesResult?.qualified ? yesResult : null;
+  const qNo  = noResult?.qualified  ? noResult  : null;
+
   let best = null;
-  if (yesResult && noResult) {
-    const aIsUltra = yesResult.scenario === 'B_ULTRA_CHEAP';
-    const bIsUltra = noResult.scenario  === 'B_ULTRA_CHEAP';
-    if (aIsUltra && !bIsUltra)       best = yesResult;
-    else if (bIsUltra && !aIsUltra)  best = noResult;
-    else best = yesResult.expectedProfit >= noResult.expectedProfit ? yesResult : noResult;
+  if (qYes && qNo) {
+    const aIsUltra = qYes.scenario === 'B_ULTRA_CHEAP';
+    const bIsUltra = qNo.scenario  === 'B_ULTRA_CHEAP';
+    if (aIsUltra && !bIsUltra)      best = qYes;
+    else if (bIsUltra && !aIsUltra) best = qNo;
+    else best = qYes.expectedProfit >= qNo.expectedProfit ? qYes : qNo;
   } else {
-    best = yesResult || noResult;
+    best = qYes || qNo;
   }
 
   if (!best) return null;
-
   return { market, secs, marketType: 'GENERAL', opportunity: best };
 }
 
 // ─── CRYPTO 5-MIN MARKET SCANNER ─────────────────────────────────────────────
-/**
- * FIX v3: Added fallback broad search.
- * v2 only tried deterministic slugs (btc-updown-5m-{ts}). If Polymarket's actual
- * slug format differs even slightly, every query returns empty and zero crypto
- * markets are ever found. The fallback searches active markets by keyword.
- */
 async function fetchCrypto5mMarkets() {
   const nowSecs     = Math.floor(Date.now() / 1000);
   const windowStart = nowSecs - (nowSecs % 300);
-  const windowEnd   = windowStart + 300;
-  const secsRemain  = windowEnd - nowSecs;
+  const secsRemain  = windowStart + 300 - nowSecs;
 
   if (secsRemain > CFG.MAX_SECS_LEFT) {
-    dbg(`Crypto windows: ${secsRemain}s left — not in scan window`);
+    dbg(`Crypto: ${secsRemain}s left in window — not scanning yet`);
     return [];
   }
 
   const windowTimestamps = [windowStart, windowStart + 300];
   const markets          = [];
 
-  // ── Phase 1: deterministic slug lookup ──────────────────────────────────
+  // Phase 1: deterministic slug lookup
   const slugFetches = [];
   for (const asset of CFG.CRYPTO_ASSETS) {
     for (const wts of windowTimestamps) {
-      const slug = `${asset}-updown-5m-${wts}`;
-      slugFetches.push({ asset, slug, windowTs: wts, secsLeft: wts + 300 - nowSecs });
+      slugFetches.push({ asset, slug: `${asset}-updown-5m-${wts}`, windowTs: wts });
     }
   }
 
@@ -359,67 +364,44 @@ async function fetchCrypto5mMarkets() {
   let slugHits = 0;
   for (const res of slugResults) {
     if (res.status !== 'fulfilled' || !res.value?.data) continue;
-    const { data, asset, secsLeft: sl } = res.value;
+    const { data, asset } = res.value;
     const items  = Array.isArray(data) ? data : (data?.data || []);
     const market = items[0];
     if (!market || market.closed || market.active === false) continue;
     slugHits++;
-
     const actualSecs = secsLeft(market);
     if (actualSecs <= 0 || actualSecs > CFG.MAX_SECS_LEFT) continue;
-
-    markets.push({
-      ...market,
-      _asset:      asset.toUpperCase(),
-      _slug:       market.slug || res.value.slug,
-      _secsLeft:   actualSecs,
-      _cryptoType: 'CRYPTO_5M',
-    });
+    markets.push({ ...market, _asset: asset.toUpperCase(), _slug: market.slug, _secsLeft: actualSecs, _cryptoType: 'CRYPTO_5M' });
   }
 
-  // ── Phase 2: broad keyword fallback if slugs matched nothing ────────────
-  // This handles the case where Polymarket changes their slug format.
+  // Phase 2: broad keyword fallback if all slugs missed
   if (slugHits === 0) {
-    dbg('Slug search found nothing — running broad crypto fallback');
+    dbg('Slug search empty — broad crypto fallback');
     const broadData = await httpGet(
       'https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=150&order=endDate&ascending=true',
       6000
     );
-    const allMarkets = Array.isArray(broadData) ? broadData : (broadData?.data || broadData?.results || []);
+    const all = Array.isArray(broadData) ? broadData : (broadData?.data || broadData?.results || []);
 
-    for (const m of allMarkets) {
+    for (const m of all) {
       const slug = (m.slug || '').toLowerCase();
       const q    = (m.question || '').toLowerCase();
+      const is5m = (slug.includes('updown') || slug.includes('up-or-down') || q.includes('go up or down'))
+                && (slug.includes('5m') || slug.includes('5min') || q.includes('5 min'));
+      if (!is5m) continue;
 
-      // Match anything that looks like a crypto 5-min up/down market
-      const isCrypto5m = (slug.includes('updown') || slug.includes('up-or-down') || q.includes('go up or down'))
-                      && (slug.includes('5m') || slug.includes('5min') || q.includes('5 min'));
-
-      if (!isCrypto5m) continue;
-
-      const assetMatch = CFG.CRYPTO_ASSETS.find(a =>
-        slug.includes(a) || q.includes(a.toUpperCase())
-      );
+      const assetMatch = CFG.CRYPTO_ASSETS.find(a => slug.includes(a) || q.includes(a));
       if (!assetMatch) continue;
 
       const actualSecs = secsLeft(m);
       if (actualSecs <= 0 || actualSecs > CFG.MAX_SECS_LEFT) continue;
-
-      // Avoid duplicates
       if (markets.find(x => (x.conditionId || x.id) === (m.conditionId || m.id))) continue;
 
-      markets.push({
-        ...m,
-        _asset:      assetMatch.toUpperCase(),
-        _slug:       m.slug || slug,
-        _secsLeft:   actualSecs,
-        _cryptoType: 'CRYPTO_5M',
-      });
+      markets.push({ ...m, _asset: assetMatch.toUpperCase(), _slug: m.slug || slug, _secsLeft: actualSecs, _cryptoType: 'CRYPTO_5M' });
     }
-    dbg(`Broad fallback found ${markets.length} crypto markets`);
+    dbg(`Broad fallback: ${markets.length} crypto markets`);
   }
 
-  dbg(`Crypto 5m markets in scan window: ${markets.length}`);
   return markets;
 }
 
@@ -433,15 +415,20 @@ async function evaluateCrypto5mMarket(market) {
     scanOrderBook(tokens[1], `${market._asset} DOWN`, CFG.MIN_ASK_PRICE_CRYPTO, CFG.MAX_ASK_PRICE),
   ]);
 
+  // Always update watching with live prices
+  updateWatching(market, [upResult, downResult].filter(Boolean));
+
+  const qUp   = upResult?.qualified   ? upResult   : null;
+  const qDown = downResult?.qualified ? downResult : null;
+
   let best = null;
-  if (upResult && downResult) {
-    best = upResult.expectedProfit >= downResult.expectedProfit ? upResult : downResult;
+  if (qUp && qDown) {
+    best = qUp.expectedProfit >= qDown.expectedProfit ? qUp : qDown;
   } else {
-    best = upResult || downResult;
+    best = qUp || qDown;
   }
 
   if (!best) return null;
-
   return { market, secs, marketType: 'CRYPTO_5M', opportunity: best };
 }
 
@@ -480,8 +467,15 @@ async function runScan() {
   log(`Scan #${S.scans} — ${generalMarkets.length} general + ${cryptoMarkets.length} crypto 5m in window`);
 
   if (totalFound === 0) {
-    dbg('No markets in window');
+    // Expire stale watching entries with no markets
+    S.noAsks++;
     return;
+  }
+
+  // Expire stale watching entries (> 60s old)
+  const now = Date.now();
+  for (const k of Object.keys(S.watching)) {
+    if (now - S.watching[k].updated > 60000) delete S.watching[k];
   }
 
   const generalBatch = generalMarkets.slice(0, 15);
@@ -498,31 +492,32 @@ async function runScan() {
   }
 
   if (hits.length === 0) {
-    dbg('No opportunities in this scan');
-    S.skipped++;
+    // Markets found but none have qualifying asks in the price range
+    S.noAsks++;
     return;
   }
 
   hits.sort((a, b) => {
-    const scoreA = a.opportunity.scenario === 'B_ULTRA_CHEAP' ? 2000
-                 : a.marketType === 'CRYPTO_5M' ? 1000 + a.opportunity.expectedProfit
-                 : a.opportunity.expectedProfit;
-    const scoreB = b.opportunity.scenario === 'B_ULTRA_CHEAP' ? 2000
-                 : b.marketType === 'CRYPTO_5M' ? 1000 + b.opportunity.expectedProfit
-                 : b.opportunity.expectedProfit;
-    return scoreB - scoreA;
+    const score = h => h.opportunity.scenario === 'B_ULTRA_CHEAP' ? 2000
+                     : h.marketType === 'CRYPTO_5M' ? 1000 + h.opportunity.expectedProfit
+                     : h.opportunity.expectedProfit;
+    return score(b) - score(a);
   });
 
+  let firedThisScan = false;
   for (const hit of hits) {
     const condId = hit.market.conditionId || hit.market.id;
     if (S.openTrades.find(t => t.conditionId === condId)) continue;
 
     if (hit.secs > CFG.SNIPE_WINDOW) {
-      dbg(`  ${shortQ(hit.market.question || hit.market._slug, 40)} — ${hit.secs.toFixed(1)}s left, waiting for <${CFG.SNIPE_WINDOW}s`);
+      // FIX v3: separated counter — this is a "waiting" case, not "no asks"
+      S.waiting++;
+      dbg(`  Waiting: ${shortQ(hit.market.question || hit.market._slug, 38)} — ${hit.secs.toFixed(1)}s`);
       continue;
     }
 
     executePaperSnipe(hit);
+    firedThisScan = true;
     break;
   }
 }
@@ -540,7 +535,7 @@ function executePaperSnipe(hit) {
   S.snipes++;
 
   const closeTs     = market.endDate ? new Date(market.endDate).getTime()
-                    : market._cryptoWindowEnd || (Date.now() + secs * 1000);
+                    : (Date.now() + secs * 1000);
   const conditionId = market.conditionId || market.id || market._slug;
 
   const trade = {
@@ -568,24 +563,19 @@ function executePaperSnipe(hit) {
   const tag    = opp.scenario === 'B_ULTRA_CHEAP' ? C.g('🎯 ULTRA-CHEAP SNIPE')
                : marketType  === 'CRYPTO_5M'      ? C.m('⚡ CRYPTO 5M SNIPE')
                :                                    C.y('◆ HIGH-CONF SNIPE');
-  const pfNote = opp.partialFill ? C.y(' (partial fill)') : '';
+  const pfNote = opp.partialFill ? C.y(' (partial)') : '';
 
   log(`\n${tag}`);
   log(`  Market:    ${C.c(shortQ(trade.question, 52))}`);
-  log(`  Outcome:   ${opp.outcomeLabel}  @ ${C.y((opp.avgFillPrice * 100).toFixed(2) + '¢')}  (ask: ${(opp.bestAskPrice * 100).toFixed(2)}¢)`);
+  log(`  Outcome:   ${opp.outcomeLabel}  @ ${C.y((opp.avgFillPrice * 100).toFixed(2) + '¢')}  ask: ${(opp.bestAskPrice * 100).toFixed(2)}¢`);
   log(`  Shares:    ${opp.sharesOwned.toFixed(3)}  cost: $${opp.totalCost.toFixed(4)}${pfNote}`);
-  log(`  Payout:    ${C.g('$' + opp.expectedPayout.toFixed(4))}  (profit: $${opp.expectedProfit.toFixed(4)})`);
+  log(`  Payout:    ${C.g('$' + opp.expectedPayout.toFixed(4))}  profit: $${opp.expectedProfit.toFixed(4)}`);
   log(`  Secs left: ${secs.toFixed(1)}  |  Balance: $${S.balance.toFixed(4)}`);
 
   saveState();
 }
 
 // ─── RESOLVE CLOSED TRADES ────────────────────────────────────────────────────
-/**
- * FIX v3: Removed dead `outcomeIsYesOrUp` variable (was computed, never used).
- * FIX v3: Resolution check now uses a single consistent helper instead of
- *         mixing .includes() and === which caused missed matches on some labels.
- */
 async function resolveClosedTrades() {
   const now = Date.now();
 
@@ -594,38 +584,29 @@ async function resolveClosedTrades() {
 
     let won = null;
     try {
-      const data   = await httpGet(
-        `https://gamma-api.polymarket.com/markets?conditionId=${trade.conditionId}`, 4000
-      );
+      const data   = await httpGet(`https://gamma-api.polymarket.com/markets?conditionId=${trade.conditionId}`, 4000);
       const arr    = Array.isArray(data) ? data : (data?.data || []);
       const market = arr[0];
 
       if (market && (market.closed || market.active === false)) {
         let prices = market.outcomePrices;
-        if (typeof prices === 'string') {
-          try { prices = JSON.parse(prices); } catch {}
-        }
+        if (typeof prices === 'string') { try { prices = JSON.parse(prices); } catch {} }
 
         if (Array.isArray(prices) && prices.length >= 2) {
           const p0 = parseFloat(prices[0]);
           const p1 = parseFloat(prices[1]);
 
-          // FIX v3: Single consistent helper — outcome label decides index.
-          // prices[0] = YES / UP side, prices[1] = NO / DOWN side.
-          // Use case-insensitive check so "BTC UP", "ETH UP", "YES" all work.
+          // FIX v3: consistent case-insensitive check — removed dead outcomeIsYesOrUp var
           const outcomeUpper  = (trade.outcome || '').toUpperCase();
           const isYesOrUpSide = outcomeUpper.includes('UP') || outcomeUpper === 'YES';
-
           won = isYesOrUpSide ? (p0 >= 0.99) : (p1 >= 0.99);
         }
       }
-    } catch(e) {
-      dbg(`Resolution error: ${e.message}`);
-    }
+    } catch(e) { dbg(`Resolution error: ${e.message}`); }
 
     if (won === null) continue;
 
-    const payout = won ? trade.sharesOwned * 1.00 * 0.98 : 0; // 2% Polymarket fee
+    const payout = won ? trade.sharesOwned * 1.00 * 0.98 : 0;
     const profit = payout - trade.betSize;
 
     S.balance += payout;
@@ -660,26 +641,24 @@ function display() {
   const runtime = ((Date.now() - S.startTime) / 60000).toFixed(1);
   const L       = C.d('─'.repeat(72));
 
-  const nowSecs  = Math.floor(Date.now() / 1000);
-  const winSecs  = 300 - (nowSecs % 300);
-  // FIX v3: Display units — was printing "0.97¢" (raw decimal), now prints "97¢"
-  const minPct   = Math.round(CFG.MIN_ASK_PRICE_CRYPTO * 100);
-  const maxPct   = Math.round(CFG.MAX_ASK_PRICE * 100);
-  const winBar   = winSecs <= CFG.MAX_SECS_LEFT ? C.y(`${winSecs}s — IN SNIPE RANGE`) : C.d(`${winSecs}s — waiting`);
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const winSecs = 300 - (nowSecs % 300);
+  const minPct  = Math.round(CFG.MIN_ASK_PRICE_CRYPTO * 100);
+  const maxPct  = Math.round(CFG.MAX_ASK_PRICE * 100);
+  const winBar  = winSecs <= CFG.MAX_SECS_LEFT ? C.y(`${winSecs}s — IN SNIPE RANGE`) : C.d(`${winSecs}s — waiting`);
 
   console.log('\n' + C.c(C.b('  ◆ POLYMARKET LAST-SECOND SNIPER  v3  —  PAPER $10')));
-  console.log(C.d('  General markets + Crypto 5-min (BTC/ETH/SOL/BNB/XRP)'));
-  // FIX v3: Now correctly shows "95¢–98¢" not "0.95¢–0.98¢"
-  console.log(C.d(`  Entry: ${minPct}¢–${maxPct}¢ in last ${CFG.SNIPE_WINDOW}s  |  scan: ${CFG.SCAN_INTERVAL_MS}ms`));
+  console.log(C.d('  General markets (93¢–98¢) + Crypto 5-min (95¢–98¢)'));
+  console.log(C.d(`  Snipe: last ${CFG.SNIPE_WINDOW}s  |  scan: ${CFG.SCAN_INTERVAL_MS}ms  |  entry: ${minPct}¢–${maxPct}¢ crypto`));
   console.log(L);
 
-  console.log(`\n  ${C.b('Balance')}    $${S.balance.toFixed(4).padStart(10)}   ${C.b('P&L')}       ${pnlStr} (${roiStr})`);
-  console.log(`  ${C.b('Start')}      $${S.startBalance.toFixed(2).padStart(10)}   ${C.b('Win rate')}  ${wr}  (${S.wins}W / ${S.losses}L)`);
-  console.log(`  ${C.b('Snipes')}     ${String(S.snipes).padStart(10)}   ${C.b('Skipped')}   ${S.skipped}`);
-  console.log(`  ${C.b('Scans')}      ${String(S.scans).padStart(10)}   ${C.b('Runtime')}   ${runtime}min`);
-  console.log(`  ${C.b('5m Window')}  ${winBar}`);
+  console.log(`\n  ${C.b('Balance')}    $${S.balance.toFixed(4).padStart(10)}   ${C.b('P&L')}        ${pnlStr} (${roiStr})`);
+  console.log(`  ${C.b('Start')}      $${S.startBalance.toFixed(2).padStart(10)}   ${C.b('Win rate')}   ${wr}  (${S.wins}W / ${S.losses}L)`);
+  console.log(`  ${C.b('Snipes')}     ${String(S.snipes).padStart(10)}   ${C.b('Waiting')}    ${S.waiting}  ${C.d('(price ok, not in window yet)')}`);
+  console.log(`  ${C.b('Scans')}      ${String(S.scans).padStart(10)}   ${C.b('No asks')}    ${S.noAsks}  ${C.d('(scanned, price out of range)')}`);
+  console.log(`  ${C.b('Runtime')}    ${runtime.padStart(9)}min   ${C.b('5m Window')}  ${winBar}`);
 
-  // Scenario breakdown
+  // ── Scenario breakdown ──────────────────────────────────────────────────────
   const closed = S.closedTrades;
   const scenB  = closed.filter(t => t.scenario === 'B_ULTRA_CHEAP');
   const scenA  = closed.filter(t => t.scenario === 'A_HIGH_CONFIDENCE' && t.marketType !== 'CRYPTO_5M');
@@ -702,26 +681,55 @@ function display() {
     }
   }
 
-  // Open positions
+  // ── WATCHING panel — live prices for all tracked markets ───────────────────
+  const watchList = Object.values(S.watching)
+    .filter(w => w.secs > 0 && w.secs <= CFG.MAX_SECS_LEFT)
+    .sort((a, b) => a.secs - b.secs)
+    .slice(0, 10);
+
+  console.log('\n' + L);
+  console.log('  ' + C.b('WATCHING') + C.d(`  (${watchList.length} markets live — prices update every scan)`));
+
+  if (watchList.length === 0) {
+    console.log(C.d('  no markets in scan window yet...'));
+  } else {
+    for (const w of watchList) {
+      const secStr  = w.secs <= CFG.SNIPE_WINDOW ? C.y(`${w.secs.toFixed(0)}s ⚡`) : C.d(`${w.secs.toFixed(0)}s`);
+      const typeTag = w.marketType === 'CRYPTO_5M' ? C.m('[5M]') : C.d('[GEN]');
+      const priceStr = w.sides.map(s => {
+        const pct = s.price != null ? (s.price * 100).toFixed(0) + '¢' : '—';
+        // Color: green if qualifies, yellow if ≥ 80¢, gray otherwise
+        const colored = s.qualifies       ? C.g(pct)
+                      : s.price >= 0.80   ? C.y(pct)
+                      :                     C.d(pct);
+        return `${s.label.split(' ').pop()}:${colored}`;
+      }).join('  ');
+
+      console.log(`  ${typeTag} ${secStr.padEnd(8)} ${C.c(shortQ(w.question, 34))}  ${priceStr}`);
+    }
+    // Reminder of what price we need to fire
+    console.log(C.d(`  Need: crypto ≥95¢ general ≥93¢ — in green = qualifies, yellow = close`));
+  }
+
+  // ── Open positions ──────────────────────────────────────────────────────────
   console.log('\n' + L);
   console.log('  ' + C.b('OPEN POSITIONS'));
   if (S.openTrades.length === 0) {
-    console.log(C.d('  scanning for last-second opportunities...'));
+    console.log(C.d('  no open positions'));
   } else {
-    for (const t of S.openTrades.slice(0, 8)) {
+    for (const t of S.openTrades.slice(0, 6)) {
       const secsTill = Math.max(0, (t.closeTs - Date.now()) / 1000).toFixed(0);
       const typeTag  = t.marketType === 'CRYPTO_5M' ? C.m('[5M]') : C.d('[GEN]');
       const pfNote   = t.partialFill ? C.y('~') : ' ';
       console.log(
-        `  ${typeTag} ${C.c(shortQ(t.question || '?', 38))}` +
+        `  ${typeTag} ${C.c(shortQ(t.question || '?', 36))}` +
         `  ${pfNote}${t.outcome} @ ${(t.entryPrice * 100).toFixed(1)}¢` +
-        `  exp: ${C.g('$' + t.expectedPayout.toFixed(3))}` +
-        `  ${secsTill}s`
+        `  exp: ${C.g('$' + t.expectedPayout.toFixed(3))}  ${secsTill}s`
       );
     }
   }
 
-  // Recent closed
+  // ── Last 10 closed ──────────────────────────────────────────────────────────
   console.log('\n' + L);
   console.log('  ' + C.b('LAST 10 CLOSED'));
   const recent = [...S.closedTrades].reverse().slice(0, 10);
@@ -737,11 +745,11 @@ function display() {
     }
   }
 
-  // Log
+  // ── Live log ────────────────────────────────────────────────────────────────
   console.log('\n' + L);
   console.log('  ' + C.b('LIVE LOG'));
-  LOGS.slice(0, 10).forEach(l => console.log('  ' + l));
-  console.log(C.d(`\n  Every ${CFG.SCAN_INTERVAL_MS}ms | snipe: last ${CFG.SNIPE_WINDOW}s | ${minPct}¢–${maxPct}¢ | Ctrl+C to stop\n`));
+  LOGS.slice(0, 8).forEach(l => console.log('  ' + l));
+  console.log(C.d(`\n  ${CFG.SCAN_INTERVAL_MS}ms scan | last ${CFG.SNIPE_WINDOW}s window | Ctrl+C to stop\n`));
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -749,32 +757,39 @@ async function main() {
   loadState();
 
   console.clear();
-  // FIX v3: Display units corrected throughout
-  const minPct = Math.round(CFG.MIN_ASK_PRICE_CRYPTO * 100);
-  const maxPct = Math.round(CFG.MAX_ASK_PRICE * 100);
+  const minGenPct   = Math.round(CFG.MIN_ASK_PRICE_GENERAL * 100);
+  const minCryptoPct = Math.round(CFG.MIN_ASK_PRICE_CRYPTO * 100);
+  const maxPct      = Math.round(CFG.MAX_ASK_PRICE * 100);
   console.log(C.c(C.b('\n  ◆ Polymarket Last-Second Sniper v3')));
   console.log(C.d(`  Paper balance: $${S.balance.toFixed(2)}  |  $${CFG.BET_SIZE} per snipe`));
   console.log(C.d(`  Crypto 5-min: ${CFG.CRYPTO_ASSETS.map(a => a.toUpperCase()).join(', ')}`));
-  console.log(C.d(`  Entry: ${minPct}¢–${maxPct}¢ in last ${CFG.SNIPE_WINDOW}s\n`));
+  console.log(C.d(`  Entry: general ${minGenPct}¢–${maxPct}¢ | crypto ${minCryptoPct}¢–${maxPct}¢ | last ${CFG.SNIPE_WINDOW}s\n`));
 
   const test = await httpGet('https://gamma-api.polymarket.com/markets?limit=1');
   if (!test) { console.error(C.r('  ERROR: Cannot reach Polymarket API')); process.exit(1); }
   log(C.g('Polymarket API connected'));
 
-  try { await runScan(); } catch(e) { log(C.r(`Scan error: ${e.message}`)); }
-  display();
+  // FIX v3: Scan lock — prevents concurrent scans when API calls exceed interval
+  let scanning = false;
 
-  setInterval(async () => {
+  const tick = async () => {
+    if (scanning) {
+      dbg('Previous scan still running — skipping tick');
+      return;
+    }
+    scanning = true;
     try { await runScan(); } catch(e) { log(C.r(`Scan error: ${e.message}`)); }
+    scanning = false;
     display();
-  }, CFG.SCAN_INTERVAL_MS);
+  };
+
+  await tick();
+  setInterval(tick, CFG.SCAN_INTERVAL_MS);
 }
 
 process.on('SIGINT', () => {
   saveState();
-  const pnl    = S.balance - S.startBalance;
-  const minPct = Math.round(CFG.MIN_ASK_PRICE_CRYPTO * 100);
-  const maxPct = Math.round(CFG.MAX_ASK_PRICE * 100);
+  const pnl = S.balance - S.startBalance;
   console.log(C.c(C.b('\n\n  ◆ Final Results')));
   console.log(`  Balance: $${S.balance.toFixed(4)}`);
   console.log(`  P&L:     ${pnl >= 0 ? C.g('+$' + pnl.toFixed(4)) : C.r('-$' + Math.abs(pnl).toFixed(4))}`);
